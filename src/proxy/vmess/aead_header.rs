@@ -24,20 +24,25 @@ use std::task::{Context, Poll};
 use std::{cmp, io};
 use tokio::io::{AsyncRead, ReadBuf};
 
+/// 创建认证 ID（Auth ID）
+/// 格式: AES128(时间戳(8字节) + 随机数(4字节) + CRC32(4字节))
 fn create_auth_id(cmd_key: &[u8], time: &[u8]) -> BytesMut {
     let mut buf = BytesMut::new();
-    buf.put_slice(time);
+    buf.put_slice(time);  // 8 字节时间戳
     let mut random_bytes = [0u8; 4];
     random_iv_or_salt(&mut random_bytes);
-    buf.put_slice(&random_bytes);
-    let zero = crc32fast::hash(&*buf);
-    buf.put_u32(zero);
+    buf.put_slice(&random_bytes);  // 4 字节随机数
+    let zero = crc32fast::hash(&*buf);  // 计算 CRC32 校验和
+    buf.put_u32(zero);  // 4 字节 CRC32
+    // 使用 KDF 派生加密密钥
     let key = vmess_kdf_1_one_shot(cmd_key, KDF_SALT_CONST_AUTH_ID_ENCRYPTION_KEY);
     let block = Aes128::new_with_slice(&key[0..16]);
-    block.encrypt_with_slice(&mut buf);
+    block.encrypt_with_slice(&mut buf);  // AES-128 加密整个 16 字节块
     buf
 }
 
+/// 封装 VMess AEAD 请求头
+/// 格式: [Auth ID(16)] + [加密的长度字段(2+16)] + [连接 Nonce(8)] + [加密的负载数据(n+16)]
 pub fn seal_vmess_aead_header(cmd_key: &[u8], data: &[u8]) -> BytesMut {
     #[cfg(not(test))]
     let time = std::time::SystemTime::now()
@@ -52,14 +57,16 @@ pub fn seal_vmess_aead_header(cmd_key: &[u8], data: &[u8]) -> BytesMut {
         b
     };
     let mut generated_auth_id = create_auth_id(cmd_key, &time);
-    let id_len = generated_auth_id.len();
+    let id_len = generated_auth_id.len();  // Auth ID 长度为 16 字节
     let mut connection_nonce = [0u8; 8];
     random_iv_or_salt(&mut connection_nonce);
 
-    // reserve (header_length + nonce + data + 2*tag) bytes
-    // total_len = 16 +
+    // 预留空间: (长度字段 + nonce + 数据 + 2*AEAD标签) 字节
+    // 总长度 = 16(AuthID) + 18(加密长度+标签) + 8(nonce) + (数据长度+标签)
     generated_auth_id.reserve(2 + connection_nonce.len() + data.len() + 2 * AES_128_GCM_TAG_LEN);
     {
+        // 第一步：加密负载长度字段
+        // 使用 KDF 派生长度加密的密钥和 nonce
         let payload_header_length_aeadkey = vmess_kdf_3_one_shot(
             cmd_key,
             KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY,
@@ -76,12 +83,15 @@ pub fn seal_vmess_aead_header(cmd_key: &[u8], data: &[u8]) -> BytesMut {
         let cipher = Aes128Gcm::new_with_slice(&payload_header_length_aeadkey[0..16]);
         let mbuf = &mut generated_auth_id.chunk_mut()[..2 + AES_128_GCM_TAG_LEN];
         let mbuf = unsafe { from_raw_parts_mut(mbuf.as_mut_ptr(), mbuf.len()) };
-        generated_auth_id.put_u16(data.len() as u16);
+        generated_auth_id.put_u16(data.len() as u16);  // 写入负载长度
+        // 使用 Auth ID 作为 AAD（附加认证数据）加密长度字段
         cipher.encrypt_inplace_with_slice(nonce, &generated_auth_id[..id_len], mbuf);
-        unsafe { generated_auth_id.advance_mut(AES_128_GCM_TAG_LEN) };
+        unsafe { generated_auth_id.advance_mut(AES_128_GCM_TAG_LEN) };  // 跳过标签
     }
-    generated_auth_id.put_slice(&connection_nonce);
+    generated_auth_id.put_slice(&connection_nonce);  // 写入连接 Nonce
     {
+        // 第二步：加密负载数据
+        // 使用 KDF 派生负载加密的密钥和 nonce
         let payload_header_aead_key = vmess_kdf_3_one_shot(
             cmd_key,
             KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_AEAD_KEY,
@@ -98,26 +108,28 @@ pub fn seal_vmess_aead_header(cmd_key: &[u8], data: &[u8]) -> BytesMut {
         let cipher = Aes128Gcm::new_with_slice(&payload_header_aead_key[0..16]);
         let mbuf = &mut generated_auth_id.chunk_mut()[..data.len() + AES_128_GCM_TAG_LEN];
         let mbuf = unsafe { from_raw_parts_mut(mbuf.as_mut_ptr(), mbuf.len()) };
-        generated_auth_id.put_slice(data);
+        generated_auth_id.put_slice(data);  // 写入负载数据
+        // 使用 Auth ID 作为 AAD 加密负载数据
         cipher.encrypt_inplace_with_slice(nonce, &generated_auth_id[..id_len], mbuf);
-        unsafe { generated_auth_id.advance_mut(AES_128_GCM_TAG_LEN) };
+        unsafe { generated_auth_id.advance_mut(AES_128_GCM_TAG_LEN) };  // 跳过标签
     }
     generated_auth_id
 }
 
+/// VMess 响应头读取器，用于读取并解密服务器响应头
 pub struct VmessHeaderReader {
-    buffer: BytesMut,
-    state: u32, // for state machine generator use
-    resp_header_len_enc: Aes128Gcm,
-    header_len_iv: [u8; 12],
-    resp_header_payload_enc: Aes128Gcm,
-    header_payload_iv: [u8; 12],
-    respv: u8,
-    data_length: usize,
-    minimal_data_to_put: usize,
-    read_res: Poll<io::Result<()>>,
-    received_resp: bool,
-    read_zero: bool,
+    buffer: BytesMut,                   // 读取缓冲区
+    state: u32,                         // 状态机生成器使用的状态
+    resp_header_len_enc: Aes128Gcm,    // 响应头长度字段解密器
+    header_len_iv: [u8; 12],           // 长度字段 IV
+    resp_header_payload_enc: Aes128Gcm, // 响应头负载解密器
+    header_payload_iv: [u8; 12],       // 负载 IV
+    respv: u8,                         // 响应版本号
+    data_length: usize,                // 数据长度
+    minimal_data_to_put: usize,        // 最小待放入数据量
+    read_res: Poll<io::Result<()>>,   // 读取结果
+    received_resp: bool,               // 是否已接收响应
+    read_zero: bool,                   // 是否读取到零字节
 }
 
 impl VmessHeaderReader {
@@ -153,6 +165,8 @@ impl VmessHeaderReader {
     }
 
     impl_read_utils!();
+    /// 读取并解密 VMess 响应头
+    /// 响应格式: [加密的长度(2+16字节)] + [加密的负载(n+16字节)]
     #[gentian]
     #[gentian_attr(ret_val=Err(ErrorKind::UnexpectedEof.into()).into())]
     pub fn poll_read_decrypted<R>(
@@ -164,7 +178,7 @@ impl VmessHeaderReader {
         R: AsyncRead + Unpin,
     {
         loop {
-            // 1. read length
+            // 1. 读取并解密长度字段（2字节数据 + 16字节AEAD标签）
             self.read_res = co_await(self.read_at_least(r, ctx, 18));
             if self.read_res.is_error() {
                 if self.read_zero {
@@ -173,7 +187,7 @@ impl VmessHeaderReader {
                 debug_log!("vmess: aead header read length error");
                 return std::mem::replace(&mut self.read_res, Poll::Pending);
             }
-            let aad = [0u8; 0];
+            let aad = [0u8; 0];  // 空的附加认证数据
             debug_log!("vmess: try aead header decrypt len");
             if !self.resp_header_len_enc.decrypt_inplace_with_slice(
                 &self.header_len_iv,
@@ -186,8 +200,8 @@ impl VmessHeaderReader {
                 return Poll::Ready(Err(err));
             }
             self.data_length = self.buffer.get_u16() as usize;
-            self.buffer.advance(16);
-            // 2. read data
+            self.buffer.advance(16);  // 跳过 AEAD 标签
+            // 2. 读取并解密负载数据
             debug_log!(
                 "vmess: try aead header read data, buffer len:{}",
                 self.buffer.len()
@@ -214,24 +228,26 @@ impl VmessHeaderReader {
                 );
                 return Poll::Ready(Err(err));
             }
-            // tag(16) + vmess command(at least 4)
+            // 验证响应头格式：至少包含 16字节标签 + 4字节VMess命令
             if self.buffer.len() < 20 {
                 debug_log!("vmess: buffer length error");
                 let err = io::Error::new(ErrorKind::InvalidData, "unexpected buffer length!");
                 return Poll::Ready(Err(err));
             }
+            // 验证响应版本号
             if self.buffer[0] != self.respv {
                 debug_log!("vmess: respv error");
                 let err = io::Error::new(ErrorKind::InvalidData, "unexpected response header!");
                 return Poll::Ready(Err(err));
             }
+            // 检查动态端口（暂不支持）
             if self.buffer[2] != 0 {
                 debug_log!("vmess: dynamic port error");
                 let err =
                     io::Error::new(ErrorKind::InvalidData, "dynamic port is not supported now!");
                 return Poll::Ready(Err(err));
             }
-            self.buffer.advance(self.data_length + 16);
+            self.buffer.advance(self.data_length + 16);  // 跳过已处理的数据
             self.data_length = self.buffer.len();
             self.received_resp = true;
             debug_log!("aead header read done");

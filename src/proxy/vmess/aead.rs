@@ -14,20 +14,22 @@ use std::task::{Context, Poll};
 use std::{cmp, io, slice};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// VMess AEAD 写入器，用于加密并写入数据
 pub struct VmessAeadWriter {
-    security: VmessSecurity,
-    buffer: BytesMut,
-    nonce: [u8; 32],
-    pos: usize,
-    iv: BytesMut,
-    count: u16,
-    data_len: usize,
-    state: u32, // for state machine generator use
-    write_res: Poll<io::Result<usize>>,
+    security: VmessSecurity,       // 加密算法（AES-128-GCM 或 ChaCha20-Poly1305）
+    buffer: BytesMut,              // 写入缓冲区
+    nonce: [u8; 32],              // 加密 nonce
+    pos: usize,                   // 当前写入位置
+    iv: BytesMut,                 // 初始化向量
+    count: u16,                   // 数据块计数器
+    data_len: usize,              // 数据长度
+    state: u32,                   // 状态机生成器使用的状态
+    write_res: Poll<io::Result<usize>>, // 写入结果
 }
+/// VMess 支持的加密算法
 pub enum VmessSecurity {
-    Aes128Gcm(Aes128Gcm),
-    ChaCha20Poly1305(ChaCha20Poly1305),
+    Aes128Gcm(Aes128Gcm),                  // AES-128-GCM 加密
+    ChaCha20Poly1305(ChaCha20Poly1305),   // ChaCha20-Poly1305 加密
 }
 
 impl VmessSecurity {
@@ -92,39 +94,41 @@ impl VmessAeadWriter {
         }
     }
 
+    /// 加密数据到缓冲区
+    /// VMess AEAD 格式: [2字节长度(未加密)] + [加密数据 + 16字节认证标签]
     fn encrypted_buffer(&mut self, data: &[u8]) {
         self.data_len = data.len();
         debug_log!("raw data len:{}", self.data_len);
-        // 1. length is not encrypted
+        // 1. 写入长度字段（未加密）
         self.buffer
             .reserve(self.data_len + 2 + self.security.tag_len());
         self.buffer
             .put_u16((self.data_len + self.security.tag_len()) as u16);
         debug_log!("encrypted buffer len1:{}", self.buffer.len());
-        // 2. construct encrypted data buf
+        // 2. 构造加密数据缓冲区（数据 + AEAD 标签空间）
         let mbuf = &mut self.buffer.chunk_mut()[..self.data_len + self.security.tag_len()];
         let mbuf = unsafe { slice::from_raw_parts_mut(mbuf.as_mut_ptr(), mbuf.len()) };
         self.buffer.put_slice(data);
         debug_log!("encrypted buffer len2:{}", self.buffer.len());
 
-        // 3. construct nonce
+        // 3. 构造 nonce（计数器 + IV）
         self.nonce[0..2].copy_from_slice(&self.count.to_be_bytes());
         self.nonce[2..12].copy_from_slice(&self.iv[2..12]);
-        // 4. encrypted data, reserved aead tag
-        let aad = [0u8; 0];
+        // 4. 就地加密数据，并生成 AEAD 认证标签
+        let aad = [0u8; 0];  // 空的附加认证数据
         let nonce_len = self.security.nonce_len();
         match &mut self.security {
             VmessSecurity::Aes128Gcm(cipher) => {
                 cipher.encrypt_inplace_with_slice(&self.nonce[..nonce_len], &aad, mbuf);
-                unsafe { self.buffer.advance_mut(16) };
+                unsafe { self.buffer.advance_mut(16) };  // 跳过 16 字节标签
             }
             VmessSecurity::ChaCha20Poly1305(cipher) => {
                 cipher.encrypt_inplace_with_slice(&self.nonce[..nonce_len], &aad, mbuf);
-                unsafe { self.buffer.advance_mut(16) };
+                unsafe { self.buffer.advance_mut(16) };  // 跳过 16 字节标签
             }
         }
         debug_log!("encrypted buffer len3:{}", self.buffer.len());
-        self.count += 1;
+        self.count += 1;  // 递增计数器，用于下一个数据块
         self.pos = 0
     }
 
@@ -148,17 +152,18 @@ impl VmessAeadWriter {
     }
 }
 
+/// VMess AEAD 读取器，用于读取并解密数据
 pub struct VmessAeadReader {
-    security: VmessSecurity,
-    pub buffer: BytesMut, // pub for replace buffer
-    state: u32,           // for state machine generator use
-    read_res: Poll<io::Result<()>>,
-    nonce: [u8; 32],
-    iv: BytesMut,
-    data_length: usize,
-    count: u16,
-    minimal_data_to_put: usize,
-    read_zero: bool,
+    security: VmessSecurity,            // 加密算法
+    pub buffer: BytesMut,              // 读取缓冲区（pub 用于替换缓冲区）
+    state: u32,                        // 状态机生成器使用的状态
+    read_res: Poll<io::Result<()>>,   // 读取结果
+    nonce: [u8; 32],                  // 解密 nonce
+    iv: BytesMut,                     // 初始化向量
+    data_length: usize,               // 数据长度
+    count: u16,                       // 数据块计数器
+    minimal_data_to_put: usize,       // 最小待放入数据量
+    read_zero: bool,                  // 是否读取到零字节
 }
 
 impl VmessAeadReader {
@@ -180,8 +185,11 @@ impl VmessAeadReader {
     }
 
     impl_read_utils!();
+
+    /// 就地解密缓冲区数据
+    /// 返回 true 表示解密成功，false 表示 AEAD 标签验证失败
     fn decrypted_data(&mut self) -> bool {
-        let aad = [0u8; 0];
+        let aad = [0u8; 0];  // 空的附加认证数据
         let nonce_len = self.security.nonce_len();
         match &mut self.security {
             VmessSecurity::Aes128Gcm(cipher) => cipher.decrypt_inplace_with_slice(
@@ -197,6 +205,8 @@ impl VmessAeadReader {
         }
     }
 
+    /// 从流中读取并解密 AEAD 加密的数据
+    /// VMess AEAD 格式: [2字节长度] + [加密数据 + 16字节AEAD标签]
     #[gentian]
     #[gentian_attr(ret_val=Err(ErrorKind::UnexpectedEof.into()).into())]
     pub fn poll_read_decrypted<R>(
@@ -209,7 +219,7 @@ impl VmessAeadReader {
         R: AsyncRead + Unpin,
     {
         loop {
-            // 1. read length
+            // 1. 读取长度字段（2字节，未加密）
             debug_log!(
                 "try read aead length, counter:{},buffer_len:{}",
                 self.count,
@@ -228,7 +238,7 @@ impl VmessAeadReader {
                 return Poll::Ready(Err(err));
             }
             self.read_reserve(self.data_length);
-            // 2. read data
+            // 2. 读取加密数据（包含 AEAD 标签）
             self.read_res = co_await(self.read_at_least(r, ctx, self.data_length));
             if self.read_res.is_error() {
                 if self.read_zero {
@@ -236,24 +246,24 @@ impl VmessAeadReader {
                 }
                 return std::mem::replace(&mut self.read_res, Poll::Pending);
             }
-            // 3. construct nonce
+            // 3. 构造 nonce（计数器 + IV）
             self.nonce[0..2].copy_from_slice(&self.count.to_be_bytes());
             self.nonce[2..12].copy_from_slice(&self.iv[2..12]);
 
-            // 4. decrypted data, includes aead tag
+            // 4. 解密数据（包含 AEAD 标签验证）
             if !self.decrypted_data() {
                 debug_log!("read decrypted failed");
                 return Poll::Ready(Err(io::Error::new(ErrorKind::Other, "invalid aead tag")));
             }
-            self.count += 1;
+            self.count += 1;  // 递增计数器
 
             debug_log!(
                 "data_length(include aead tag): {},buffer_len:{}",
                 self.data_length,
                 self.buffer.len()
             );
-            self.data_length -= 16; //remove tag
-                                    // 5. put data
+            self.data_length -= 16; // 移除 16 字节 AEAD 标签
+            // 5. 将解密后的数据放入目标缓冲区
             while self.calc_data_to_put(dst) != 0 {
                 dst.put_slice(&self.buffer.as_ref()[0..self.minimal_data_to_put]);
                 self.data_length -= self.minimal_data_to_put;
@@ -262,7 +272,7 @@ impl VmessAeadReader {
                 debug_log!("put data len:{}", self.minimal_data_to_put);
                 co_yield(Poll::Ready(Ok(())));
             }
-            self.buffer.advance(16);
+            self.buffer.advance(16);  // 跳过 AEAD 标签
         }
     }
 }
